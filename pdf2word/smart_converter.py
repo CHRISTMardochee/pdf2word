@@ -1,12 +1,13 @@
 """
-Smart Text Converter module (V3 — Client Reference Match).
-Produces DOCX output matching the client's Generali brochure format:
-- Cover page with red background text panels
-- 2-column tables with left red border for "Que faire si..." 
-  and thin red border for right coverage panels
-- Proper icon/image placement
-- Form fields on last page
-- Deduplicated footer
+Smart Text Converter module (V4 — Universal).
+Produces high-quality DOCX from any PDF using PyMuPDF:
+- Preserves original fonts, sizes, colors (bold, italic)
+- Detects headings by font size
+- Extracts and places images at correct positions
+- Handles multi-column layouts via table-based rendering  
+- Reconstructs bullet/numbered lists
+- Separates header/footer from body content
+- Handles page breaks between pages
 """
 
 import logging
@@ -16,57 +17,47 @@ import tempfile
 
 import fitz  # PyMuPDF
 from docx import Document
-from docx.shared import Inches, Pt, Cm, Emu, RGBColor
+from docx.shared import Inches, Pt, Cm, RGBColor
 from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.enum.section import WD_ORIENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
-from lxml import etree
 
 logger = logging.getLogger(__name__)
 
 _CONTROL_CHARS = re.compile(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]')
+_BULLET_PATTERN = re.compile(r'^[\s]*[•●○◦▪▸►–—\-\*]\s+')
+_NUMBER_PATTERN = re.compile(r'^[\s]*\d{1,3}[\.\)]\s+')
 W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
-
-# Generali brand colors
-RED = "C5281C"
-CORAL = "F2634A"
-GREY = "6D6E71"
-LIGHT_GREY = "E0E0E0"
 
 
 class SmartConverter:
     """
-    Intelligent PDF-to-DOCX converter matching Generali brochure format.
+    Universal PDF-to-DOCX converter using PyMuPDF.
+    Automatically adapts to any PDF layout without hardcoded styles.
     """
 
-    HEADING_MIN_SIZE = 13.0
-    SUBHEADING_MIN_SIZE = 10.5
-    COLUMN_THRESHOLD = 0.45
-    ROW_TOLERANCE = 20.0
-    FOOTER_Y_THRESHOLD = 0.92
+    HEADER_Y_THRESHOLD = 0.06   # Top 6% = header zone
+    FOOTER_Y_THRESHOLD = 0.92   # Bottom 8% = footer zone
+    COLUMN_GAP_MIN = 30.0       # Min gap between columns (pts)
+    MIN_IMAGE_SIZE = 15         # Min image dimension to extract (pts)
 
     def __init__(self):
         pass
 
     def convert(self, input_pdf: str, output_docx: str,
                 pages: list[int] | None = None) -> str:
-        logger.info("Smart V3 converting: %s -> %s", input_pdf, output_docx)
+        logger.info("Smart V4 converting: %s -> %s", input_pdf, output_docx)
 
         pdf_doc = fitz.open(input_pdf)
         doc = Document()
 
-        # Base style
+        # Set default style
         style = doc.styles['Normal']
-        style.font.name = 'Arial'
+        style.font.name = 'Calibri'
         style.font.size = Pt(10)
-        style.font.color.rgb = RGBColor(0x6D, 0x6E, 0x71)
 
-        # Heading styles
-        for level in [1, 2, 3]:
-            h_style = doc.styles[f'Heading {level}']
-            h_style.font.color.rgb = RGBColor(0xC5, 0x28, 0x1C)
-            h_style.font.name = 'Arial'
+        # Analyze the entire document to determine global font metrics
+        font_stats = self._analyze_fonts(pdf_doc, pages)
 
         page_numbers = pages if pages else list(range(len(pdf_doc)))
 
@@ -81,414 +72,341 @@ class SmartConverter:
                 if page_idx > 0:
                     doc.add_page_break()
 
-                # Extract images
-                self._extract_images(doc, page, pdf_doc, tmp_dir, page_num)
-
-                # Extract text blocks
-                text_dict = page.get_text("dict")
-                raw_blocks = [b for b in text_dict.get("blocks", [])
-                              if b["type"] == 0 and self._block_has_text(b)]
-
-                # Separate footer
-                footer_y = page.rect.height * self.FOOTER_Y_THRESHOLD
-                content_blocks = [b for b in raw_blocks if b["bbox"][1] < footer_y]
-                footer_blocks = [b for b in raw_blocks if b["bbox"][1] >= footer_y]
-
-                # Is this the cover page? (has white text = overlaid on image)
-                is_cover = self._is_cover_page(content_blocks)
-
-                if is_cover:
-                    self._process_cover_page(doc, content_blocks)
-                else:
-                    self._process_content_page(doc, content_blocks, page.rect.width)
-
-                # Footer
-                if footer_blocks:
-                    self._add_footer(doc, footer_blocks)
+                self._process_page(doc, page, pdf_doc, tmp_dir, page_num, font_stats)
 
         pdf_doc.close()
 
+        # Set margins
         for section in doc.sections:
-            section.left_margin = Cm(1.5)
-            section.right_margin = Cm(1.5)
-            section.top_margin = Cm(1.0)
-            section.bottom_margin = Cm(1.0)
+            section.left_margin = Cm(2.0)
+            section.right_margin = Cm(2.0)
+            section.top_margin = Cm(1.5)
+            section.bottom_margin = Cm(1.5)
 
         doc.save(output_docx)
-        logger.info("Smart V3 conversion complete: %s", output_docx)
+        logger.info("Smart V4 conversion complete: %s", output_docx)
         return output_docx
 
-    # ── Cover Page ──────────────────────────────────────────────
+    # ── Font Analysis ────────────────────────────────────────────
 
-    def _is_cover_page(self, blocks: list) -> bool:
-        """Check if blocks contain white text (indicating cover page overlay)."""
+    def _analyze_fonts(self, pdf_doc: fitz.Document,
+                       pages: list[int] | None) -> dict:
+        """Analyze fonts across the PDF to determine heading thresholds dynamically."""
+        size_counts = {}
+        page_numbers = pages if pages else list(range(min(len(pdf_doc), 20)))  # Sample max 20 pages
+
+        for page_num in page_numbers:
+            if page_num >= len(pdf_doc):
+                continue
+            page = pdf_doc[page_num]
+            text_dict = page.get_text("dict")
+            for block in text_dict.get("blocks", []):
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        text = span.get("text", "").strip()
+                        if not text:
+                            continue
+                        size = round(span.get("size", 10), 1)
+                        size_counts[size] = size_counts.get(size, 0) + len(text)
+
+        if not size_counts:
+            return {"body_size": 10.0, "heading1_min": 16.0, "heading2_min": 12.0}
+
+        # Body size = most common font size (by character count)
+        body_size = max(size_counts, key=size_counts.get)
+
+        # Get all sizes sorted
+        sizes = sorted(size_counts.keys())
+        larger_sizes = [s for s in sizes if s > body_size + 1.0]
+
+        heading1_min = larger_sizes[-1] if len(larger_sizes) >= 1 else body_size + 6.0
+        heading2_min = larger_sizes[0] if len(larger_sizes) >= 1 else body_size + 2.0
+        if len(larger_sizes) >= 2:
+            heading1_min = larger_sizes[-1] if larger_sizes[-1] > heading2_min + 2 else heading2_min + 2
+            heading2_min = larger_sizes[0]
+
+        logger.info("Font stats: body=%.1f, h2_min=%.1f, h1_min=%.1f",
+                     body_size, heading2_min, heading1_min)
+
+        return {
+            "body_size": body_size,
+            "heading1_min": heading1_min,
+            "heading2_min": heading2_min,
+        }
+
+    # ── Page Processing ──────────────────────────────────────────
+
+    def _process_page(self, doc: Document, page: fitz.Page,
+                      pdf_doc: fitz.Document, tmp_dir: str,
+                      page_num: int, font_stats: dict):
+        """Process a single page: extract images, text blocks, detect layout."""
+        page_h = page.rect.height
+        page_w = page.rect.width
+
+        # 1. Extract text blocks
+        text_dict = page.get_text("dict")
+        raw_blocks = [b for b in text_dict.get("blocks", [])
+                      if b["type"] == 0 and self._block_has_text(b)]
+
+        # 2. Separate header/body/footer
+        header_y = page_h * self.HEADER_Y_THRESHOLD
+        footer_y = page_h * self.FOOTER_Y_THRESHOLD
+
+        body_blocks = [b for b in raw_blocks
+                       if b["bbox"][1] >= header_y and b["bbox"][1] < footer_y]
+
+        # 3. Extract and place images BEFORE text so they appear in order
+        img_positions = self._extract_images(doc, page, pdf_doc, tmp_dir,
+                                             page_num, header_y, footer_y)
+
+        # 4. Detect column layout
+        columns = self._detect_columns(body_blocks, page_w)
+
+        if columns == 2:
+            self._render_two_columns(doc, body_blocks, page_w, font_stats)
+        else:
+            self._render_single_column(doc, body_blocks, font_stats)
+
+    # ── Column Detection ─────────────────────────────────────────
+
+    def _detect_columns(self, blocks: list, page_width: float) -> int:
+        """Detect if the page has 1 or 2 columns."""
+        if not blocks:
+            return 1
+
+        mid = page_width / 2.0
+        left_only = 0
+        right_only = 0
+        full_width = 0
+
         for block in blocks:
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    color = span.get("color", 0)
-                    if color == 0xFFFFFF:
-                        return True
-        return False
+            x0, _, x1, _ = block["bbox"]
+            block_width = x1 - x0
 
-    def _process_cover_page(self, doc: Document, blocks: list):
-        """Process cover page: red-background panels for white text, normal for others."""
+            if block_width > page_width * 0.55:
+                full_width += 1
+            elif x1 < mid + 20:
+                left_only += 1
+            elif x0 > mid - 20:
+                right_only += 1
+            else:
+                full_width += 1
+
+        total = left_only + right_only + full_width
+        if total == 0:
+            return 1
+
+        # Need substantial content on both sides for 2-column
+        if left_only >= 3 and right_only >= 3:
+            return 2
+
+        return 1
+
+    # ── Single Column Rendering ──────────────────────────────────
+
+    def _render_single_column(self, doc: Document, blocks: list, font_stats: dict):
+        """Render blocks in single-column reading order."""
         sorted_blocks = sorted(blocks, key=lambda b: b["bbox"][1])
 
         for block in sorted_blocks:
-            style_type = self._get_block_style(block)
-            has_white = any(
-                span.get("color", 0) == 0xFFFFFF
-                for line in block.get("lines", [])
-                for span in line.get("spans", [])
-            )
+            self._add_block(doc, block, font_stats)
 
-            if has_white:
-                # White text → red background panel
-                para = doc.add_paragraph()
-                self._fill_paragraph(para, block, style_type=style_type)
-                # Set red background shading
-                self._set_paragraph_shading(para, RED)
-                # Make text white and larger
-                for run in para.runs:
-                    run.font.color.rgb = RGBColor(0xFF, 0xFF, 0xFF)
-                para.paragraph_format.space_before = Pt(4)
-                para.paragraph_format.space_after = Pt(2)
-            else:
-                self._add_block(doc, block)
+    # ── Two Column Rendering ─────────────────────────────────────
 
-    def _set_paragraph_shading(self, para, color: str):
-        """Set paragraph background color (shading)."""
-        pPr = para._element.get_or_add_pPr()
-        shd = OxmlElement('w:shd')
-        shd.set(qn('w:val'), 'clear')
-        shd.set(qn('w:color'), 'auto')
-        shd.set(qn('w:fill'), color)
-        pPr.append(shd)
+    def _render_two_columns(self, doc: Document, blocks: list,
+                            page_width: float, font_stats: dict):
+        """Render two-column layout using a Word table."""
+        mid = page_width / 2.0
 
-    # ── Content Pages ───────────────────────────────────────────
-
-    def _process_content_page(self, doc: Document, blocks: list, page_width: float):
-        """Process content page with column layout detection."""
-        if not blocks:
-            return
-
-        col_split = page_width * self.COLUMN_THRESHOLD
-
-        # Classify blocks
         full_width = []
         left_col = []
         right_col = []
 
         for block in blocks:
             x0, _, x1, _ = block["bbox"]
-            width = x1 - x0
-            if width > page_width * 0.55:
-                full_width.append(block)
-            elif x0 < col_split:
-                left_col.append(block)
-            else:
-                right_col.append(block)
+            block_width = x1 - x0
 
+            if block_width > page_width * 0.55:
+                full_width.append(block)
+            elif x1 < mid + 20:
+                left_col.append(block)
+            elif x0 > mid - 20:
+                right_col.append(block)
+            else:
+                full_width.append(block)
+
+        # Sort each column by Y position
         full_width.sort(key=lambda b: b["bbox"][1])
         left_col.sort(key=lambda b: b["bbox"][1])
         right_col.sort(key=lambda b: b["bbox"][1])
 
-        # Build sections between full-width headings
-        all_items = []
-        fw_positions = sorted([(b["bbox"][1], b) for b in full_width])
-        boundaries = [0.0] + [y for y, _ in fw_positions] + [9999.0]
+        # Build interleaved output: full-width blocks, then column pairs
+        all_elements = []
+        for b in full_width:
+            all_elements.append(("full", b["bbox"][1], b))
+        if left_col or right_col:
+            min_y = min(
+                (left_col[0]["bbox"][1] if left_col else 9999),
+                (right_col[0]["bbox"][1] if right_col else 9999)
+            )
+            all_elements.append(("cols", min_y, left_col, right_col))
 
-        for i in range(len(boundaries) - 1):
-            zone_top = boundaries[i]
-            zone_bottom = boundaries[i + 1]
+        all_elements.sort(key=lambda x: x[1])
 
-            # Full-width block at boundary
-            for y, fw_block in fw_positions:
-                if abs(y - zone_top) < self.ROW_TOLERANCE:
-                    all_items.append(("full", fw_block))
-
-            # Column blocks in this zone
-            z_left = [b for b in left_col if zone_top - 30 <= b["bbox"][1] < zone_bottom]
-            z_right = [b for b in right_col if zone_top - 30 <= b["bbox"][1] < zone_bottom]
-
-            if z_left and z_right:
-                all_items.append(("two_col", z_left, z_right))
-            else:
-                for b in z_left:
-                    all_items.append(("full", b))
-                for b in z_right:
-                    all_items.append(("full", b))
-
-        # Render
-        for item in all_items:
+        for item in all_elements:
             if item[0] == "full":
-                self._add_block(doc, item[1])
-            elif item[0] == "two_col":
-                self._add_two_column_section(doc, item[1], item[2])
+                self._add_block(doc, item[2], font_stats)
+            elif item[0] == "cols":
+                self._add_column_table(doc, item[2], item[3], font_stats)
 
-    def _add_two_column_section(self, doc: Document, left_blocks: list, right_blocks: list):
-        """
-        Render two-column content as a Word table matching the client reference:
-        - Left column: "Que faire si..." with thick red left border
-        - Right column: coverage details with thin red full border
-        """
-        is_que_faire = any(
-            "que faire" in span.get("text", "").lower()
-            for b in left_blocks
-            for line in b.get("lines", [])
-            for span in line.get("spans", [])
-        )
-
+    def _add_column_table(self, doc: Document, left_blocks: list,
+                          right_blocks: list, font_stats: dict):
+        """Render two columns as a borderless Word table."""
         table = doc.add_table(rows=1, cols=2)
         table.autofit = True
 
-        # Column widths
-        tbl = table._tbl
-        tbl_pr = tbl.find(f"{{{W_NS}}}tblPr")
-        if tbl_pr is None:
-            tbl_pr = OxmlElement('w:tblPr')
-            tbl.insert(0, tbl_pr)
-
-        # Set table width
-        tbl_w = OxmlElement('w:tblW')
-        tbl_w.set(qn('w:w'), '5000')
-        tbl_w.set(qn('w:type'), 'pct')
-        tbl_pr.append(tbl_w)
+        # Remove all borders
+        self._set_table_borders(table, show=False)
 
         # Fill left cell
         left_cell = table.cell(0, 0)
         left_cell.paragraphs[0].text = ""
-        self._set_cell_width(left_cell, Cm(8.5))
         for i, block in enumerate(left_blocks):
-            para = left_cell.paragraphs[0] if i == 0 else left_cell.add_paragraph()
-            self._fill_paragraph(para, block)
-
-        # Style left cell: thick red left border only
-        if is_que_faire:
-            self._set_cell_borders(left_cell, left_color=RED, left_size="18")
-        
-        # Add vertical padding
-        self._set_cell_margin(left_cell, top=Cm(0.3), bottom=Cm(0.3), left=Cm(0.4), right=Cm(0.3))
+            if i == 0:
+                para = left_cell.paragraphs[0]
+            else:
+                para = left_cell.add_paragraph()
+            self._fill_paragraph(para, block, font_stats)
 
         # Fill right cell
         right_cell = table.cell(0, 1)
         right_cell.paragraphs[0].text = ""
-        self._set_cell_width(right_cell, Cm(9.5))
         for i, block in enumerate(right_blocks):
-            para = right_cell.paragraphs[0] if i == 0 else right_cell.add_paragraph()
-            self._fill_paragraph(para, block)
-
-        # Style right cell: thin red border all around
-        self._set_cell_borders(right_cell,
-                               top_color=RED, bottom_color=RED,
-                               left_color=RED, right_color=RED,
-                               top_size="4", bottom_size="4",
-                               left_size="4", right_size="4")
-        self._set_cell_margin(right_cell, top=Cm(0.3), bottom=Cm(0.3), left=Cm(0.4), right=Cm(0.4))
-
-        # Remove default table borders (we use cell borders instead)
-        self._remove_table_borders(table)
-
-        # Spacing after table
-        spacer = doc.add_paragraph()
-        spacer.paragraph_format.space_before = Pt(6)
-        spacer.paragraph_format.space_after = Pt(2)
-        spacer_pf = spacer._element.get_or_add_pPr()
-        sz_elem = OxmlElement('w:sz')
-        sz_elem.set(qn('w:val'), '4')
-
-    # ── Cell Styling Helpers ────────────────────────────────────
-
-    def _set_cell_width(self, cell, width):
-        """Set cell preferred width."""
-        tc = cell._tc
-        tc_pr = tc.get_or_add_tcPr()
-        tc_w = OxmlElement('w:tcW')
-        tc_w.set(qn('w:w'), str(int(width.emu / 635)))  # EMU to twips approx
-        tc_w.set(qn('w:type'), 'dxa')
-        tc_pr.append(tc_w)
-
-    def _set_cell_borders(self, cell, **kwargs):
-        """Set individual cell borders. Pass top_color, left_color, etc."""
-        tc = cell._tc
-        tc_pr = tc.get_or_add_tcPr()
-
-        existing = tc_pr.find(qn('w:tcBorders'))
-        if existing is not None:
-            tc_pr.remove(existing)
-
-        borders = OxmlElement('w:tcBorders')
-
-        for edge in ["top", "left", "bottom", "right"]:
-            color = kwargs.get(f"{edge}_color")
-            size = kwargs.get(f"{edge}_size", "4")
-            border = OxmlElement(f'w:{edge}')
-            if color:
-                border.set(qn('w:val'), 'single')
-                border.set(qn('w:sz'), size)
-                border.set(qn('w:space'), '0')
-                border.set(qn('w:color'), color)
+            if i == 0:
+                para = right_cell.paragraphs[0]
             else:
-                border.set(qn('w:val'), 'nil')
-            borders.append(border)
+                para = right_cell.add_paragraph()
+            self._fill_paragraph(para, block, font_stats)
 
-        tc_pr.append(borders)
+    # ── Block Rendering ──────────────────────────────────────────
 
-    def _set_cell_margin(self, cell, top=None, bottom=None, left=None, right=None):
-        """Set cell padding/margins."""
-        tc = cell._tc
-        tc_pr = tc.get_or_add_tcPr()
+    def _add_block(self, doc: Document, block: dict, font_stats: dict):
+        """Add a text block as a properly styled paragraph."""
+        style_type = self._classify_block(block, font_stats)
+        text = self._get_block_text(block).strip()
 
-        mar = OxmlElement('w:tcMar')
-        for edge, val in [("top", top), ("bottom", bottom), ("start", left), ("end", right)]:
-            if val:
-                m = OxmlElement(f'w:{edge}')
-                m.set(qn('w:w'), str(int(val.emu / 635)))
-                m.set(qn('w:type'), 'dxa')
-                mar.append(m)
-        tc_pr.append(mar)
+        # Detect bullet/numbered list
+        is_bullet = bool(_BULLET_PATTERN.match(text))
+        is_numbered = bool(_NUMBER_PATTERN.match(text))
 
-    def _remove_table_borders(self, table):
-        """Remove all table-level borders (use cell-level instead)."""
-        tbl = table._tbl
-        tbl_pr = tbl.find(f"{{{W_NS}}}tblPr")
-        if tbl_pr is None:
-            return
-
-        existing = tbl_pr.find(f"{{{W_NS}}}tblBorders")
-        if existing is not None:
-            tbl_pr.remove(existing)
-
-        borders = OxmlElement('w:tblBorders')
-        for edge in ["top", "left", "bottom", "right", "insideH", "insideV"]:
-            border = OxmlElement(f'w:{edge}')
-            border.set(qn('w:val'), 'none')
-            border.set(qn('w:sz'), '0')
-            border.set(qn('w:space'), '0')
-            border.set(qn('w:color'), 'FFFFFF')
-            borders.append(border)
-        tbl_pr.append(borders)
-
-    # ── Block Rendering ─────────────────────────────────────────
-
-    def _get_block_style(self, block: dict) -> str:
-        max_size = 0
-        has_red = False
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                max_size = max(max_size, span.get("size", 0))
-                color = span.get("color", 0)
-                r = (color >> 16) & 0xFF
-                if r > 150 and ((color >> 8) & 0xFF) < 120:
-                    has_red = True
-
-        if max_size >= self.HEADING_MIN_SIZE:
-            return "heading"
-        elif max_size >= self.SUBHEADING_MIN_SIZE and has_red:
-            return "subheading"
-        return "body"
-
-    def _add_block(self, doc: Document, block: dict):
-        """Add a text block as a paragraph."""
-        style_type = self._get_block_style(block)
-
-        if style_type == "heading":
+        if style_type == "heading1":
             para = doc.add_heading(level=1)
-        elif style_type == "subheading":
+        elif style_type == "heading2":
             para = doc.add_heading(level=2)
+        elif is_bullet:
+            para = doc.add_paragraph(style='List Bullet')
+        elif is_numbered:
+            para = doc.add_paragraph(style='List Number')
         else:
             para = doc.add_paragraph()
 
-        self._fill_paragraph(para, block, style_type=style_type)
+        self._fill_paragraph(para, block, font_stats)
 
-    def _fill_paragraph(self, para, block: dict, style_type: str = None):
-        """Fill a paragraph with formatted runs."""
-        if style_type is None:
-            style_type = self._get_block_style(block)
+    def _classify_block(self, block: dict, font_stats: dict) -> str:
+        """Classify a block as heading1, heading2, or body based on font stats."""
+        max_size = 0
+        is_bold = False
 
-        # Clear existing
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                max_size = max(max_size, span.get("size", 0))
+                if span.get("flags", 0) & 16:
+                    is_bold = True
+
+        if max_size >= font_stats["heading1_min"]:
+            return "heading1"
+        elif max_size >= font_stats["heading2_min"] and is_bold:
+            return "heading2"
+        elif max_size > font_stats["body_size"] + 1.5 and is_bold:
+            return "heading2"
+        return "body"
+
+    def _fill_paragraph(self, para, block: dict, font_stats: dict):
+        """Fill paragraph with formatted runs preserving font, size, color, bold, italic."""
+        # Clear existing runs
         for run in para.runs:
             run.text = ""
 
-        for line in block.get("lines", []):
+        first_run = True
+        for line_idx, line in enumerate(block.get("lines", [])):
+            # Add line break between lines (except first)
+            if line_idx > 0 and not first_run:
+                # Check if previous line ends with hyphen (word wrap)
+                prev_text = para.runs[-1].text if para.runs else ""
+                if prev_text.endswith("-"):
+                    # Remove hyphen for word continuation
+                    para.runs[-1].text = prev_text[:-1]
+                else:
+                    # Add space between lines from same block
+                    para.add_run(" ")
+
             for span in line.get("spans", []):
                 text = self._sanitize(span.get("text", ""))
                 if not text:
                     continue
 
+                first_run = False
                 run = para.add_run(text)
 
-                font_size = span.get("size", 10)
+                # Font size
+                font_size = span.get("size", font_stats["body_size"])
                 run.font.size = Pt(font_size)
 
+                # Font color
                 color_int = span.get("color", 0)
                 r = (color_int >> 16) & 0xFF
                 g = (color_int >> 8) & 0xFF
                 b = color_int & 0xFF
                 run.font.color.rgb = RGBColor(r, g, b)
 
-                if span.get("flags", 0) & 16:
+                # Bold & Italic
+                flags = span.get("flags", 0)
+                if flags & 16:
                     run.font.bold = True
-                if span.get("flags", 0) & 2:
+                if flags & 2:
                     run.font.italic = True
 
+                # Font name (clean up PDF font names)
                 font_name = span.get("font", "")
-                clean_font = font_name.split("+")[-1] if "+" in font_name else font_name
-                clean_font = clean_font.split("-")[0] if "-" in clean_font else clean_font
+                clean_font = self._clean_font_name(font_name)
                 if clean_font:
                     run.font.name = clean_font
 
-        # Spacing
+        # Paragraph spacing
         pf = para.paragraph_format
-        if style_type == "heading":
-            pf.space_before = Pt(14)
+        style_type = self._classify_block(block, font_stats)
+        if style_type == "heading1":
+            pf.space_before = Pt(16)
+            pf.space_after = Pt(6)
+        elif style_type == "heading2":
+            pf.space_before = Pt(10)
             pf.space_after = Pt(4)
-        elif style_type == "subheading":
-            pf.space_before = Pt(8)
-            pf.space_after = Pt(3)
         else:
-            pf.space_before = Pt(1)
-            pf.space_after = Pt(1)
+            pf.space_before = Pt(2)
+            pf.space_after = Pt(2)
+            pf.line_spacing = Pt(14)
 
-    # ── Footer ──────────────────────────────────────────────────
-
-    def _add_footer(self, doc: Document, footer_blocks: list):
-        """Add footer text deduplicated."""
-        seen = set()
-        
-        # Separator line
-        sep = doc.add_paragraph()
-        sep.paragraph_format.space_before = Pt(12)
-        sep.paragraph_format.space_after = Pt(2)
-        sep_run = sep.add_run("─" * 70)
-        sep_run.font.color.rgb = RGBColor(0xE0, 0xE0, 0xE0)
-        sep_run.font.size = Pt(6)
-        
-        for block in sorted(footer_blocks, key=lambda b: b["bbox"][1]):
-            text = self._get_block_text(block).strip()
-            key = text[:30]
-            if key in seen or not text:
-                continue
-            seen.add(key)
-
-            para = doc.add_paragraph()
-            para.paragraph_format.space_before = Pt(0)
-            para.paragraph_format.space_after = Pt(0)
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    t = self._sanitize(span.get("text", ""))
-                    if t:
-                        run = para.add_run(t)
-                        run.font.size = Pt(7)
-                        run.font.color.rgb = RGBColor(0x6D, 0x6E, 0x71)
-
-    # ── Image Extraction ────────────────────────────────────────
+    # ── Image Extraction ─────────────────────────────────────────
 
     def _extract_images(self, doc: Document, page: fitz.Page,
-                        pdf_doc: fitz.Document, tmp_dir: str, page_num: int):
-        """Extract images via pixmap rendering (standard PNG)."""
+                        pdf_doc: fitz.Document, tmp_dir: str,
+                        page_num: int, header_y: float, footer_y: float) -> list:
+        """Extract images from the page and add them to the document."""
         img_info_list = page.get_image_info(xrefs=True)
         seen_xrefs = set()
+        positions = []
 
         for info in img_info_list:
             xref = info.get("xref", 0)
@@ -502,7 +420,12 @@ class SmartConverter:
 
             w_pt = abs(bbox[2] - bbox[0])
             h_pt = abs(bbox[3] - bbox[1])
-            if w_pt < 10 or h_pt < 10:
+            if w_pt < self.MIN_IMAGE_SIZE or h_pt < self.MIN_IMAGE_SIZE:
+                continue
+
+            # Skip images in header/footer zones
+            img_y = bbox[1]
+            if img_y < header_y or img_y >= footer_y:
                 continue
 
             img_path = os.path.join(tmp_dir, f"img_p{page_num}_x{xref}.png")
@@ -510,7 +433,9 @@ class SmartConverter:
                 clip = fitz.Rect(bbox) & page.rect
                 if clip.is_empty or clip.width < 5 or clip.height < 5:
                     continue
-                mat = fitz.Matrix(2.5, 2.5)
+                # High-quality render
+                scale = min(3.0, max(2.0, 600.0 / max(clip.width, clip.height)))
+                mat = fitz.Matrix(scale, scale)
                 pix = page.get_pixmap(matrix=mat, clip=clip, alpha=False)
                 pix.save(img_path)
             except Exception as e:
@@ -520,28 +445,82 @@ class SmartConverter:
             if not os.path.isfile(img_path):
                 continue
 
-            visible_w_pt = clip.width
-            max_w_in = (page.rect.width - 60) / 72.0
-            width_in = min(visible_w_pt / 72.0, max_w_in)
+            # Calculate width in inches
+            max_w_in = (page.rect.width - 80) / 72.0
+            width_in = min(w_pt / 72.0, max_w_in)
             if width_in < 0.3:
-                width_in = 2.0
+                width_in = min(2.0, max_w_in)
 
             try:
                 para = doc.add_paragraph()
                 para.alignment = WD_ALIGN_PARAGRAPH.CENTER
                 run = para.add_run()
                 run.add_picture(img_path, width=Inches(width_in))
-                para.paragraph_format.space_before = Pt(6)
-                para.paragraph_format.space_after = Pt(6)
+                para.paragraph_format.space_before = Pt(4)
+                para.paragraph_format.space_after = Pt(4)
+                positions.append(img_y)
                 logger.info("Added image xref=%d (%.1f in wide)", xref, width_in)
             except Exception as e:
-                logger.warning("Image xref=%d DOCX failed: %s", xref, str(e)[:80])
+                logger.warning("Image xref=%d insert failed: %s", xref, str(e)[:80])
 
-    # ── Utilities ───────────────────────────────────────────────
+        return positions
+
+    # ── Table border helpers ─────────────────────────────────────
+
+    def _set_table_borders(self, table, show: bool = True):
+        """Set or remove all table borders."""
+        tbl = table._tbl
+        tbl_pr = tbl.find(f"{{{W_NS}}}tblPr")
+        if tbl_pr is None:
+            tbl_pr = OxmlElement('w:tblPr')
+            tbl.insert(0, tbl_pr)
+
+        existing = tbl_pr.find(f"{{{W_NS}}}tblBorders")
+        if existing is not None:
+            tbl_pr.remove(existing)
+
+        borders = OxmlElement('w:tblBorders')
+        for edge in ["top", "left", "bottom", "right", "insideH", "insideV"]:
+            border = OxmlElement(f'w:{edge}')
+            if show:
+                border.set(qn('w:val'), 'single')
+                border.set(qn('w:sz'), '4')
+                border.set(qn('w:color'), 'D0D0D0')
+            else:
+                border.set(qn('w:val'), 'none')
+                border.set(qn('w:sz'), '0')
+                border.set(qn('w:color'), 'FFFFFF')
+            border.set(qn('w:space'), '0')
+            borders.append(border)
+        tbl_pr.append(borders)
+
+    # ── Utilities ────────────────────────────────────────────────
 
     @staticmethod
     def _sanitize(text: str) -> str:
         return _CONTROL_CHARS.sub('', text)
+
+    @staticmethod
+    def _clean_font_name(font_name: str) -> str:
+        """Clean PDF font name to a standard name."""
+        if not font_name:
+            return ""
+        # Remove subset prefix (e.g., ABCDEF+Arial -> Arial)
+        if "+" in font_name:
+            font_name = font_name.split("+", 1)[-1]
+        # Remove style suffix (e.g., Arial-Bold -> Arial)
+        base = font_name.split("-")[0].split(",")[0]
+        # Map common PDF font names to Windows/system equivalents
+        font_map = {
+            "TimesNewRoman": "Times New Roman",
+            "ArialMT": "Arial",
+            "CourierNew": "Courier New",
+            "Helvetica": "Arial",
+            "HelveticaNeue": "Arial",
+            "Times": "Times New Roman",
+            "Courier": "Courier New",
+        }
+        return font_map.get(base, base)
 
     def _block_has_text(self, block: dict) -> bool:
         for line in block.get("lines", []):
