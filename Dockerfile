@@ -3,18 +3,16 @@ FROM python:3.12-slim
 LABEL maintainer="pdf2word"
 LABEL description="PDF to DOCX converter with LibreOffice headless engine"
 
-# Install LibreOffice Writer (headless) + Microsoft fonts for best fidelity
+# Install LibreOffice Writer (headless) + fonts for fidelity
 RUN apt-get update && \
-    # Accept EULA for Microsoft fonts
-    echo "ttf-mscorefonts-installer msttcorefonts/accepted-mscorefonts-eula select true" | debconf-set-selections && \
     apt-get install -y --no-install-recommends \
         libreoffice-writer \
         libreoffice-core \
         fonts-liberation \
         fonts-dejavu \
         fonts-noto \
+        fonts-freefont-ttf \
         fontconfig \
-        ttf-mscorefonts-installer \
     && fc-cache -f -v \
     && rm -rf /var/lib/apt/lists/*
 

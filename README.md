@@ -19,7 +19,9 @@ pip install pdf2word
 
 **Linux (Debian/Ubuntu)** :
 ```bash
-sudo apt install libreoffice-writer fonts-liberation ttf-mscorefonts-installer
+sudo apt install libreoffice-writer fonts-liberation fonts-dejavu
+# Polices Microsoft (optionnel, améliore la fidélité) :
+sudo add-apt-repository multiverse && sudo apt update && sudo apt install ttf-mscorefonts-installer
 ```
 
 **macOS** :
