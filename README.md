@@ -14,8 +14,20 @@ pip install pdf2word
 | Moteur | Plateforme | Installation |
 |---|---|---|
 | **MS Word** (meilleure qualité) | Windows | MS Office installé |
-| **LibreOffice** (recommandé Linux) | Linux/macOS | `sudo apt install libreoffice-writer` |
+| **LibreOffice** (recommandé Linux/macOS) | Linux/macOS/Windows | Voir ci-dessous |
 | **Tesseract** (OCR, optionnel) | Toutes | [Guide](https://github.com/tesseract-ocr/tesseract) |
+
+**Linux (Debian/Ubuntu)** :
+```bash
+sudo apt install libreoffice-writer fonts-liberation ttf-mscorefonts-installer
+```
+
+**macOS** :
+```bash
+brew install --cask libreoffice
+# OCR (optionnel)
+brew install tesseract
+```
 
 ## Utilisation
 
