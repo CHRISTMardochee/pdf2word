@@ -8,6 +8,7 @@ import sys
 
 from .converter import PDFToWordConverter
 from .docx_to_pdf import docx_to_pdf
+from .config import save_api_key, remove_api_key
 
 
 def main():
@@ -49,9 +50,13 @@ def main():
     )
     convert_parser.add_argument(
         "--mode",
-        choices=["auto", "text", "ocr", "hybrid", "combined", "smart", "msword", "libreoffice"],
+        choices=["auto", "text", "ocr", "hybrid", "combined", "smart", "libreoffice", "msword", "cloud", "docling"],
         default="auto",
-        help="Conversion mode: auto, text, ocr, hybrid, combined, smart, msword (Windows), or libreoffice (Linux)",
+        help="Conversion mode: auto, text, ocr, hybrid, combined, smart, msword (Windows), libreoffice (Linux), or cloud (API)",
+    )
+    convert_parser.add_argument(
+        "--api-key",
+        help="API key for cloud mode (ConvertAPI secret).",
     )
     convert_parser.add_argument(
         "--dpi",
@@ -84,6 +89,17 @@ def main():
         help="Enable verbose logging",
     )
 
+    # --- set-key command ---
+    setkey_parser = subparsers.add_parser(
+        "set-key", help="Save your ConvertAPI secret key globally for cloud conversions"
+    )
+    setkey_parser.add_argument("api_key", help="Your ConvertAPI secret key")
+
+    # --- remove-key command ---
+    removekey_parser = subparsers.add_parser(
+        "remove-key", help="Remove the globally saved ConvertAPI secret key"
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -91,7 +107,8 @@ def main():
         sys.exit(1)
 
     # Set up logging
-    log_level = logging.DEBUG if args.verbose else logging.INFO
+    is_verbose = getattr(args, "verbose", False)
+    log_level = logging.DEBUG if is_verbose else logging.INFO
     logging.basicConfig(
         level=log_level,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -102,6 +119,10 @@ def main():
         _run_convert(args)
     elif args.command == "reconvert":
         _run_reconvert(args)
+    elif args.command == "set-key":
+        _run_set_key(args)
+    elif args.command == "remove-key":
+        _run_remove_key(args)
 
 
 def _run_convert(args):
@@ -125,6 +146,7 @@ def _run_convert(args):
         enhance=not args.no_enhance,
         mode=args.mode,
         dpi=args.dpi,
+        api_key=getattr(args, 'api_key', None),
     )
 
     result = converter.convert(
@@ -150,6 +172,25 @@ def _run_reconvert(args):
 
     print(f"\n[OK] Reconversion complete!")
     print(f"   Output: {pdf_path}")
+
+
+def _run_set_key(args):
+    """Execute the set-key command."""
+    try:
+        save_api_key(args.api_key)
+        print("\n[OK] API Key successfully saved!")
+        print("You can now use '--mode cloud' without passing the key each time.")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to save API keys: {e}")
+
+
+def _run_remove_key(args):
+    """Execute the remove-key command."""
+    try:
+        remove_api_key()
+        print("\n[OK] API Key successfully removed.")
+    except Exception as e:
+        print(f"\n[ERROR] Failed to remove API keys: {e}")
 
 
 if __name__ == "__main__":

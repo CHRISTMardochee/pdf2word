@@ -1,7 +1,7 @@
 [project]
 name = "pdf2word"
-version = "0.2.0"
-description = "Convert PDF to DOCX preserving formatting — supports MS Word, LibreOffice, and PyMuPDF engines"
+version = "0.3.0"
+description = "Convert PDF to DOCX preserving formatting — supports Smart (PyMuPDF), Docling ML (IBM), Cloud API, MS Word, and LibreOffice engines"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
@@ -25,14 +25,15 @@ dependencies = [
     "python-docx>=1.1.0",
     "pdf2docx>=0.5.8",
     "pdfplumber>=0.11.0",
-    "pytesseract>=0.3.10",
-    "opencv-python>=4.9.0",
     "Pillow>=10.0.0",
-    "pywin32>=306 ; sys_platform == 'win32'",
+    "lxml>=4.9.0",
 ]
 
 [project.optional-dependencies]
 ocr = ["pytesseract>=0.3.10", "opencv-python>=4.9.0"]
+ml = ["docling>=2.0.0"]
+cloud = ["convertapi>=3.0.0"]
+win = ["pywin32>=306"]
 
 [project.scripts]
 pdf2word = "pdf2word.cli:main"
